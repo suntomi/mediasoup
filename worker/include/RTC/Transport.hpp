@@ -51,6 +51,25 @@ namespace RTC
 	protected:
 		using onSendCallback   = const std::function<void(bool sent)>;
 		using onQueuedCallback = const std::function<void(bool queued, bool sctpSendBufferFull)>;
+	public:
+		using QueueCB = const std::function<void(bool queued, bool sctpSendBufferFull)>;
+		using CreateProducerCB = std::function<RTC::Producer *(
+			RTC::Shared*,
+		  const std::string&,
+		  RTC::Producer::Listener*,
+		  const FBS::Transport::ProduceRequest*
+		)>;
+		using CreateConsumerCB = std::function<RTC::Consumer *(
+			RTC::RtpParameters::Type,
+			RTC::Shared*,
+			const std::string&,
+			const std::string&,
+			RTC::Consumer::Listener*,
+			const FBS::Transport::ConsumeRequest*
+		)>;
+		static void SetProducerFactory(CreateProducerCB &&pf);
+		static void SetConsumerFactory(CreateConsumerCB &&cf);
+		struct RTC::RtpHeaderExtensionIds &ext_ids();
 
 	public:
 		class Listener
@@ -297,6 +316,12 @@ namespace RTC
 		  uint32_t ppid) override;
 		void OnSctpAssociationBufferedAmount(
 		  RTC::SctpAssociation* sctpAssociation, uint32_t bufferedAmount) override;
+    void OnSctpStreamReset(RTC::SctpAssociation* sctpAssociation, uint16_t streamId) override;
+    void OnSctpWebRtcDataChannelControlDataReceived(
+      RTC::SctpAssociation* sctpAssociation,
+      uint16_t streamId,
+      const uint8_t* msg,
+      size_t len) override;
 
 		/* Pure virtual methods inherited from RTC::TransportCongestionControlClient::Listener. */
 	public:
@@ -336,7 +361,7 @@ namespace RTC
 		// Allocated by this.
 		RTC::SctpAssociation* sctpAssociation{ nullptr };
 
-	private:
+	protected:
 		// Passed by argument.
 		Listener* listener{ nullptr };
 		// Allocated by this.

@@ -13,7 +13,6 @@
 #include "RTC/RtpStreamRecv.hpp"
 #include "RTC/Shared.hpp"
 #include "RTC/Transport.hpp"
-#include "RTC/WebRtcServer.hpp"
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 #include <string>
@@ -21,6 +20,7 @@
 
 namespace RTC
 {
+	class WebRtcServer;
 	class Router : public RTC::Transport::Listener,
 	               public RTC::RtpObserver::Listener,
 	               public Channel::ChannelSocket::RequestHandler
@@ -43,6 +43,14 @@ namespace RTC
 	public:
 		flatbuffers::Offset<FBS::Router::DumpResponse> FillBuffer(
 		  flatbuffers::FlatBufferBuilder& builder) const;
+		const absl::flat_hash_set<RTC::Consumer*> &GetConsumersOf(RTC::Producer *p) const {
+			auto it = this->mapProducerConsumers.find(p);
+			if (it == this->mapProducerConsumers.end()) {
+				static absl::flat_hash_set<RTC::Consumer*> empty;
+				return empty;
+			}
+			return it->second;
+		}
 
 		/* Methods inherited from Channel::ChannelSocket::RequestHandler. */
 	public:
