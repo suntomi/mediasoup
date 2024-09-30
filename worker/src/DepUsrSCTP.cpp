@@ -63,7 +63,7 @@ absl::flat_hash_map<uintptr_t, RTC::SctpAssociation*> DepUsrSCTP::mapIdSctpAssoc
 
 /* Static methods. */
 
-void DepUsrSCTP::ClassInit()
+void DepUsrSCTP::ClassInit(SendStcpDataCB onSend)
 {
 	MS_TRACE();
 
@@ -73,7 +73,7 @@ void DepUsrSCTP::ClassInit()
 
 	if (GlobalInstances == 0)
 	{
-		usrsctp_init_nothreads(0, onSendSctpData, sctpDebug);
+		usrsctp_init_nothreads(0, onSend != nullptr ? onSend : onSendSctpData, sctpDebug);
 
 		// Disable explicit congestion notifications (ecn).
 		usrsctp_sysctl_set_sctp_ecn_enable(0);
@@ -205,6 +205,10 @@ RTC::SctpAssociation* DepUsrSCTP::RetrieveSctpAssociation(uintptr_t id)
 	}
 
 	return it->second;
+}
+
+size_t DepUsrSCTP::CheckInterval() {
+	return CheckerInterval;
 }
 
 /* DepUsrSCTP::Checker instance methods. */

@@ -179,7 +179,7 @@ namespace RTC
 		// Passed by argument.
 		const std::string id;
 
-	private:
+	protected:
 		// Passed by argument.
 		RTC::Shared* shared{ nullptr };
 		RTC::Producer::Listener* listener{ nullptr };

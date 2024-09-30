@@ -10,6 +10,10 @@
 #include "MediaSoupErrors.hpp"
 #include <cstring> // std::memset(), std::memcpy()
 
+extern "C" { // access to private api
+  void *srtp_get_stream(srtp_t srtp, uint32_t ssrc);
+}
+
 namespace RTC
 {
 	/* Static. */
@@ -96,6 +100,36 @@ namespace RTC
 	SrtpSession::SrtpSession(Type type, CryptoSuite cryptoSuite, uint8_t* key, size_t keyLen)
 	{
 		MS_TRACE();
+		srtp_policy_t policy = CreatePolicy(type, 0, cryptoSuite, key, keyLen);
+
+		// Set the SRTP session.
+		const srtp_err_status_t err = srtp_create(&this->session, &policy);
+
+		if (DepLibSRTP::IsError(err))
+		{
+			MS_THROW_ERROR("srtp_create() failed: %s", DepLibSRTP::GetErrorString(err));
+		}
+	}
+
+	SrtpSession::~SrtpSession()
+	{
+		MS_TRACE();
+
+		if (this->session != nullptr)
+		{
+			const srtp_err_status_t err = srtp_dealloc(this->session);
+
+			if (DepLibSRTP::IsError(err))
+			{
+				MS_ABORT("srtp_dealloc() failed: %s", DepLibSRTP::GetErrorString(err));
+			}
+		}
+	}
+
+	srtp_policy_t SrtpSession::CreatePolicy(
+	  Type type, uint32_t ssrc, CryptoSuite cryptoSuite, uint8_t* key, size_t keyLen)
+	{
+		MS_TRACE();
 
 		srtp_policy_t policy; // NOLINT(cppcoreguidelines-pro-type-member-init)
 
@@ -147,6 +181,12 @@ namespace RTC
 		  (int)keyLen == policy.rtp.cipher_key_len,
 		  "given keyLen does not match policy.rtp.cipher_keyLen");
 
+		if (ssrc != 0)
+		{
+			policy.ssrc.type = ssrc_specific;
+		}
+		else
+		{
 		switch (type)
 		{
 			case Type::INBOUND:
@@ -157,36 +197,16 @@ namespace RTC
 				policy.ssrc.type = ssrc_any_outbound;
 				break;
 		}
+		}
 
-		policy.ssrc.value = 0;
+		policy.ssrc.value = ssrc;
 		policy.key        = key;
 		// Required for sending RTP retransmission without RTX.
 		policy.allow_repeat_tx = 1;
 		policy.window_size     = 1024;
 		policy.next            = nullptr;
 
-		// Set the SRTP session.
-		const srtp_err_status_t err = srtp_create(&this->session, &policy);
-
-		if (DepLibSRTP::IsError(err))
-		{
-			MS_THROW_ERROR("srtp_create() failed: %s", DepLibSRTP::GetErrorString(err));
-		}
-	}
-
-	SrtpSession::~SrtpSession()
-	{
-		MS_TRACE();
-
-		if (this->session != nullptr)
-		{
-			const srtp_err_status_t err = srtp_dealloc(this->session);
-
-			if (DepLibSRTP::IsError(err))
-			{
-				MS_ABORT("srtp_dealloc() failed: %s", DepLibSRTP::GetErrorString(err));
-			}
-		}
+		return policy;
 	}
 
 	bool SrtpSession::EncryptRtp(const uint8_t** data, size_t* len)
@@ -300,4 +320,26 @@ namespace RTC
 
 		return true;
 	}
+
+	bool SrtpSession::SetRoc(uint32_t ssrc, uint32_t roc, const std::string& srtp_remote_key, CryptoSuite srtp_crypto_suite) {
+    bool stream_added = srtp_get_stream(this->session, htonl(ssrc)) != nullptr;
+    if (!stream_added) {
+      // create and add new stream for the ssrc, because libsrtp never add actual stream for it unless payload authentication passed,
+      // but authentication always fails if we do not set roc, which requires actual stream to exist
+      auto policy = RTC::SrtpSession::CreatePolicy(RTC::SrtpSession::Type::INBOUND, ssrc, srtp_crypto_suite,
+        const_cast<uint8_t *>(reinterpret_cast<const uint8_t *>(srtp_remote_key.c_str())), srtp_remote_key.size());
+      if (DepLibSRTP::IsError(srtp_stream_add(this->session, &policy))) {
+        return false;
+      }
+    }
+    // after adding stream, we can set roc to the stream, then decryption should be ok
+    if (DepLibSRTP::IsError(srtp_stream_set_roc(this->session, ssrc, roc))) {
+      return false;
+    }
+		return true;
+	}
+	bool SrtpSession::GetRoc(uint32_t ssrc, uint32_t& roc) {
+		return !DepLibSRTP::IsError(srtp_stream_get_roc(this->session, ssrc, &roc));
+	}
+
 } // namespace RTC
