@@ -217,6 +217,8 @@ namespace RTC
 		// After calling this method, all the extension ids are reset to 0.
 		void SetExtensions(uint8_t type, const std::vector<GenericExtension>& extensions);
 
+		void UpdateExtensions(const std::vector<GenericExtension>& new_ext_values);
+
 		uint16_t GetHeaderExtensionId() const
 		{
 			if (!this->headerExtension)

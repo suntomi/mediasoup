@@ -1065,4 +1065,43 @@ namespace RTC
 			}
 		}
 	}
+
+	void RtpPacket::UpdateExtensions(const std::vector<GenericExtension>& new_ext_values)
+	{
+		uint8_t type = 0;
+		std::vector<GenericExtension> new_exts;
+		if (HasOneByteExtensions()) {
+			type = 1u;
+			for (const auto ext : this->oneByteExtensions) {
+				if (ext == nullptr) { continue; }
+				// +1 because len = 0 means len = 1 for 1byte extensions
+				new_exts.push_back({ext->id, static_cast<uint8_t>(ext->len + 1), ext->value});
+			}
+		} else if (HasTwoBytesExtensions()) {
+			type = 2u;
+			for (const auto &ext : this->mapTwoBytesExtensions) {
+				new_exts.push_back({ext.first, ext.second->len, ext.second->value});
+			}
+		} else {
+			MS_ASSERT(false, "no header extension present");
+			return;
+		}
+		bool updated = false;
+		for (const auto &nv : new_ext_values) {
+			for (auto &ext : new_exts) {
+				if (ext.id == nv.id) {
+					// same id already exists, update
+					ext.len = nv.len;
+					ext.value = nv.value;
+					updated = true;
+					break;
+				}
+			}
+			if (!updated) {
+				new_exts.push_back(nv);
+			}
+		}
+		this->headerExtension->id = 0; // clear extension id
+		SetExtensions(type, new_exts);
+	}
 } // namespace RTC

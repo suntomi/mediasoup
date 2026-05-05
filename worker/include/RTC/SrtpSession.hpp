@@ -37,6 +37,11 @@ namespace RTC
 		SrtpSession(Type type, CryptoSuite cryptoSuite, uint8_t* key, size_t keyLen);
 		~SrtpSession();
 
+		inline srtp_t context() const { return this->session; }
+		static srtp_policy_t CreatePolicy(Type type, uint32_t ssrc, CryptoSuite cryptoSuite, uint8_t* key, size_t keyLen);
+		bool SetRoc(uint32_t ssrc, uint32_t roc, const std::string& srtp_remote_key, CryptoSuite srtp_crypto_suite);
+		bool GetRoc(uint32_t ssrc, uint32_t& roc);
+
 	public:
 		bool EncryptRtp(const uint8_t** data, size_t* len);
 		bool DecryptSrtp(uint8_t* data, size_t* len);
@@ -44,7 +49,11 @@ namespace RTC
 		bool DecryptSrtcp(uint8_t* data, size_t* len);
 		void RemoveStream(uint32_t ssrc)
 		{
-			srtp_stream_remove(this->session, uint32_t{ htonl(ssrc) });
+			// FIX(iyatomi): srtp_t manage streams that belong to it by using ssrc of network byte order.
+			// srtp_stream_remove convert ssrc to network byte order by using htonl.
+			// here, ssrc should be host byte order, htonl is not required. 
+			// now srtp_stream_remove can correctly remove stream with that ssrc
+			srtp_stream_remove(this->session, ssrc);
 		}
 
 	private:

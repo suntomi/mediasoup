@@ -115,7 +115,7 @@ namespace RTC
 	  size_t maxSctpMessageSize,
 	  size_t sctpSendBufferSize,
 	  bool isDataChannel)
-	  : id(DepUsrSCTP::GetNextSctpAssociationId()), listener(listener), os(os), mis(mis),
+	  : id(SctpAssociation::GetNextSctpAssociationId()), listener(listener), os(os), mis(mis),
 	    maxSctpMessageSize(maxSctpMessageSize), sctpSendBufferSize(sctpSendBufferSize),
 	    isDataChannel(isDataChannel)
 	{
@@ -292,8 +292,6 @@ namespace RTC
 
 		// Register the SctpAssociation from the global map.
 		DepUsrSCTP::DeregisterSctpAssociation(this);
-
-		delete[] this->messageBuffer;
 	}
 
 	void SctpAssociation::TransportConnected()
@@ -392,8 +390,8 @@ namespace RTC
 		usrsctp_conninput(reinterpret_cast<void*>(this->id), data, len, 0);
 	}
 
-	void SctpAssociation::SendSctpMessage(
-	  RTC::DataConsumer* dataConsumer, const uint8_t* msg, size_t len, uint32_t ppid, onQueuedCallback* cb)
+	int SctpAssociation::SendSctpMessage(
+	 	const RTC::SctpStreamParameters &parameters, const uint8_t* msg, size_t len, uint32_t ppid, onQueuedCallback* cb)
 	{
 		MS_TRACE();
 
@@ -403,8 +401,6 @@ namespace RTC
 		  "given message exceeds max allowed message size [message size:%zu, max message size:%zu]",
 		  len,
 		  this->maxSctpMessageSize);
-
-		const auto& parameters = dataConsumer->GetSctpStreamParameters();
 
 		// Fill sctp_sendv_spa.
 		struct sctp_sendv_spa spa
@@ -482,24 +478,19 @@ namespace RTC
 				(*cb)(false, sctpSendBufferFull);
 				delete cb;
 			}
-
-			if (sctpSendBufferFull)
-			{
-				dataConsumer->SctpAssociationSendBufferFull();
-			}
+			return sctpSendBufferFull ? SctpSendResult::ErrorAgain : SctpSendResult::ErrorOthers;
 		}
 		else if (cb)
 		{
 			(*cb)(true, false);
 			delete cb;
 		}
+		return SctpSendResult::Ok;
 	}
 
-	void SctpAssociation::HandleDataConsumer(RTC::DataConsumer* dataConsumer)
+	void SctpAssociation::HandleDataConsumer(uint16_t streamId)
 	{
 		MS_TRACE();
-
-		auto streamId = dataConsumer->GetSctpStreamParameters().streamId;
 
 		// We need more OS.
 		if (streamId > this->os - 1)
@@ -508,11 +499,9 @@ namespace RTC
 		}
 	}
 
-	void SctpAssociation::DataProducerClosed(RTC::DataProducer* dataProducer)
+	void SctpAssociation::DataProducerClosed(uint16_t streamId)
 	{
 		MS_TRACE();
-
-		auto streamId = dataProducer->GetSctpStreamParameters().streamId;
 
 		// Send SCTP_RESET_STREAMS to the remote.
 		// https://tools.ietf.org/html/rfc8831#section-6.7
@@ -526,11 +515,9 @@ namespace RTC
 		}
 	}
 
-	void SctpAssociation::DataConsumerClosed(RTC::DataConsumer* dataConsumer)
+	void SctpAssociation::DataConsumerClosed(uint16_t streamId)
 	{
 		MS_TRACE();
-
-		auto streamId = dataConsumer->GetSctpStreamParameters().streamId;
 
 		// Send SCTP_RESET_STREAMS to the remote.
 		ResetSctpStream(streamId, StreamDirection::OUTGOING);
@@ -682,78 +669,90 @@ namespace RTC
 	void SctpAssociation::OnUsrSctpReceiveSctpData(
 	  uint16_t streamId, uint16_t ssn, uint32_t ppid, int flags, const uint8_t* data, size_t len)
 	{
-		// Ignore WebRTC DataChannel Control DATA chunks.
-		if (ppid == 50)
-		{
-			MS_WARN_TAG(sctp, "ignoring SCTP data with ppid:50 (WebRTC DataChannel Control)");
-
-			return;
-		}
-
-		if (this->messageBufferLen != 0 && ssn != this->lastSsnReceived)
-		{
-			MS_WARN_TAG(
-			  sctp,
-			  "message chunk received with different SSN while buffer not empty, buffer discarded [ssn:%" PRIu16
-			  ", last ssn received:%" PRIu16 "]",
-			  ssn,
-			  this->lastSsnReceived);
-
-			this->messageBufferLen = 0;
-		}
-
-		// Update last SSN received.
-		this->lastSsnReceived = ssn;
-
 		auto eor = static_cast<bool>(flags & MSG_EOR);
+		MessageKey key{ streamId, ssn, ppid };
+		auto it = this->messageBuffers.find(key);
+		auto bufferedLen = (it != this->messageBuffers.end()) ? it->second.data.size() : 0u;
 
-		if (this->messageBufferLen + len > this->maxSctpMessageSize)
+		if (bufferedLen + len > this->maxSctpMessageSize)
 		{
 			MS_WARN_TAG(
 			  sctp,
-			  "ongoing received message exceeds max allowed message size [message size:%zu, max message size:%zu, eor:%u]",
-			  this->messageBufferLen + len,
+			  "ongoing received message exceeds max allowed message size [streamId:%" PRIu16
+			  ", ssn:%" PRIu16 ", ppid:%" PRIu32 ", message size:%zu, max message size:%zu, eor:%u]",
+			  streamId,
+			  ssn,
+			  ppid,
+			  bufferedLen + len,
 			  this->maxSctpMessageSize,
 			  eor ? 1 : 0);
 
-			this->lastSsnReceived = 0;
+			if (it != this->messageBuffers.end())
+			{
+				this->messageBuffers.erase(it);
+			}
 
 			return;
 		}
 
-		// If end of message and there is no buffered data, notify it directly.
-		if (eor && this->messageBufferLen == 0)
+		// Fast path for unfragmented message.
+		if (eor && bufferedLen == 0u)
 		{
-			MS_DEBUG_DEV("directly notifying listener [eor:1, buffer len:0]");
+			MS_DEBUG_DEV(
+			  "directly notifying listener [streamId:%" PRIu16 ", ssn:%" PRIu16 ", ppid:%" PRIu32
+			  ", eor:1, buffer len:0]",
+			  streamId,
+			  ssn,
+			  ppid);
 
-			this->listener->OnSctpAssociationMessageReceived(this, streamId, data, len, ppid);
-		}
-		// If end of message and there is buffered data, append data and notify buffer.
-		else if (eor && this->messageBufferLen != 0)
-		{
-			std::memcpy(this->messageBuffer + this->messageBufferLen, data, len);
-			this->messageBufferLen += len;
-
-			MS_DEBUG_DEV("notifying listener [eor:1, buffer len:%zu]", this->messageBufferLen);
-
-			this->listener->OnSctpAssociationMessageReceived(
-			  this, streamId, this->messageBuffer, this->messageBufferLen, ppid);
-
-			this->messageBufferLen = 0;
-		}
-		// If non end of message, append data to the buffer.
-		else if (!eor)
-		{
-			// Allocate the buffer if not already done.
-			if (!this->messageBuffer)
+			if (ppid == 50u)
 			{
-				this->messageBuffer = new uint8_t[this->maxSctpMessageSize];
+				this->listener->OnSctpWebRtcDataChannelControlDataReceived(this, streamId, data, len);
 			}
+			else
+			{
+				this->listener->OnSctpAssociationMessageReceived(this, streamId, data, len, ppid);
+			}
+		}
+		else
+		{
+			auto& buffer = this->messageBuffers[key].data;
 
-			std::memcpy(this->messageBuffer + this->messageBufferLen, data, len);
-			this->messageBufferLen += len;
+			buffer.insert(buffer.end(), data, data + len);
 
-			MS_DEBUG_DEV("data buffered [eor:0, buffer len:%zu]", this->messageBufferLen);
+			if (eor)
+			{
+				MS_DEBUG_DEV(
+				  "notifying listener [streamId:%" PRIu16 ", ssn:%" PRIu16 ", ppid:%" PRIu32
+				  ", eor:1, buffer len:%zu]",
+				  streamId,
+				  ssn,
+				  ppid,
+				  buffer.size());
+
+				if (ppid == 50u)
+				{
+					this->listener->OnSctpWebRtcDataChannelControlDataReceived(
+					  this, streamId, buffer.data(), buffer.size());
+				}
+				else
+				{
+					this->listener->OnSctpAssociationMessageReceived(
+					  this, streamId, buffer.data(), buffer.size(), ppid);
+				}
+
+				this->messageBuffers.erase(key);
+			}
+			else
+			{
+				MS_DEBUG_DEV(
+				  "data buffered [streamId:%" PRIu16 ", ssn:%" PRIu16 ", ppid:%" PRIu32
+				  ", eor:0, buffer len:%zu]",
+				  streamId,
+				  ssn,
+				  ppid,
+				  buffer.size());
+			}
 		}
 	}
 
@@ -1047,6 +1046,11 @@ namespace RTC
 						ResetSctpStream(streamId, StreamDirection::OUTGOING);
 					}
 				}
+				for (uint16_t i{ 0 }; i < numStreams; ++i)
+				{
+					auto streamId = notification->sn_strreset_event.strreset_stream_list[i];
+					this->listener->OnSctpStreamReset(this, streamId);
+				}
 
 				break;
 			}
@@ -1110,4 +1114,34 @@ namespace RTC
 			this->listener->OnSctpAssociationBufferedAmount(this, this->sctpBufferedAmount);
 		}
 	}
+	static thread_local uintptr_t sctpThreadId{ 0 };
+	static thread_local uintptr_t sctpAssociationIdSeed{ 0 };
+	uintptr_t SctpAssociation::GetSctpThreadId() {
+		return sctpThreadId;
+	}
+	void SctpAssociation::ClearSctpThreadId() {
+		sctpThreadId = 0;
+		sctpAssociationIdSeed = 0;
+	}
+	void SctpAssociation::SetSctpThreadId(uint16_t id) {
+		sctpThreadId = id;
+		sctpAssociationIdSeed = ((uintptr_t)id) << (8 * (sizeof(uintptr_t) - 2));
+		MS_ASSERT(sctpAssociationIdSeed != 0, "sctpAssociationIdSeed should not be 0");
+	}
+	uintptr_t SctpAssociation::GetNextSctpAssociationId() {
+		auto &assocs = DepUsrSCTP::associations();
+		while (assocs.find(sctpAssociationIdSeed) != assocs.end())
+		{
+			++sctpAssociationIdSeed;
+
+			// if id part become 0, that means id rounds. so reset it to initialId
+			if ((sctpAssociationIdSeed & ((1ULL << (8 * (sizeof(uintptr_t) - 2))) - 1)) == 0u)
+			{
+				sctpAssociationIdSeed = sctpThreadId << (8 * (sizeof(uintptr_t) - 2));
+			}
+		}
+		// upper 16bits of addr is the thread id
+		return sctpAssociationIdSeed++;
+	}
+
 } // namespace RTC
